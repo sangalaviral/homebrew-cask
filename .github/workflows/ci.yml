@@ -238,6 +238,147 @@ jobs:
           !matrix.skip_install
         timeout-minutes: 30
 
+      - name: Check for additional zap paths
+        run: |
+          brew ruby <<'EOF'
+            require "cask/cask_loader"
+            require "open3"
+            require "utils/github/actions"
+
+            cask = Cask::CaskLoader.load('${{ matrix.cask.path }}')
+
+            CommandResult = Struct.new(:success, :timed_out, :exit_status, :stdout, :stderr, keyword_init: true)
+
+            def append_step_summary(markdown)
+              return unless (summary_path = ENV["GITHUB_STEP_SUMMARY"])
+
+              File.open(summary_path, "a") { |file| file.puts markdown }
+            end
+
+            def system_command_with_timeout(*command, timeout:)
+              stdout_reader, stdout_writer = IO.pipe
+              stderr_reader, stderr_writer = IO.pipe
+              pid = Process.spawn(*command, out: stdout_writer, err: stderr_writer)
+              stdout_writer.close
+              stderr_writer.close
+              deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+
+              loop do
+                process_id, status = Process.waitpid2(pid, Process::WNOHANG)
+                if process_id
+                  stdout = stdout_reader.read
+                  stderr = stderr_reader.read
+                  stdout_reader.close
+                  stderr_reader.close
+
+                  return CommandResult.new(
+                    success: status.success?,
+                    timed_out: false,
+                    exit_status: status.exitstatus,
+                    stdout:,
+                    stderr:,
+                  )
+                end
+                break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+                sleep 0.1
+              end
+
+              Process.kill("TERM", pid)
+              sleep 1
+              Process.kill("KILL", pid)
+              Process.wait(pid)
+              stdout = stdout_reader.read
+              stderr = stderr_reader.read
+              stdout_reader.close
+              stderr_reader.close
+              CommandResult.new(success: false, timed_out: true, exit_status: nil, stdout:, stderr:)
+            rescue Errno::ECHILD, Errno::ESRCH
+              CommandResult.new(success: false, timed_out: false, exit_status: nil, stdout: "", stderr: "")
+            end
+
+            app_artifacts = cask.artifacts.grep(Cask::Artifact::App).select do |artifact|
+              artifact.target.directory?
+            end
+
+            app_artifacts.each do |artifact|
+              result = system_command_with_timeout(
+                "/usr/bin/open", "-g", artifact.target.to_s,
+                timeout: 10,
+              )
+
+              if result.timed_out
+                puts "Warning: Timed out opening #{artifact.target} after 10 seconds."
+              elsif !result.success
+                puts "Warning: Failed to open #{artifact.target} " \
+                     "(exit status: #{result.exit_status || "unknown"})."
+              end
+
+              puts result.stdout if result.stdout.present?
+              warn result.stderr if result.stderr.present?
+            end
+
+            sleep 10 if app_artifacts.any?
+
+            brew = ENV.fetch("HOMEBREW_BREW_FILE")
+            stdout, stderr, status = Open3.capture3(brew, "generate-zap", cask.full_name)
+            unless status.success?
+              message = "Unable to check generated zap paths:\n#{stderr.presence || stdout}"
+              puts GitHub::Actions::Annotation.new(:warning, message, file: '${{ matrix.cask.path }}')
+              append_step_summary <<~MARKDOWN
+                ## Possible missing zap paths
+
+                Unable to check `#{cask.full_name}` with `brew generate-zap`.
+
+                ```text
+                #{stderr.presence || stdout}
+                ```
+              MARKDOWN
+              exit
+            end
+
+            stanza = stdout[/^zap .*/m]
+            exit unless stanza
+
+            generated_paths = stanza.scan(/"([^"]+)"/).flatten
+            exit if generated_paths.empty?
+
+            existing_paths = cask.artifacts.grep(Cask::Artifact::Zap).flat_map do |artifact|
+              artifact.directives.slice(:trash, :delete, :rmdir).values.flatten
+            end.map(&:to_s)
+
+            missing_paths = generated_paths.reject do |generated_path|
+              existing_paths.any? do |existing_path|
+                existing_path == generated_path || File.fnmatch?(existing_path, generated_path)
+              end
+            end
+
+            exit if missing_paths.empty?
+
+            message = "brew generate-zap found paths not covered by the current zap stanza:\n"
+            message += missing_paths.join("\n")
+            puts GitHub::Actions::Annotation.new(:warning, message, file: '${{ matrix.cask.path }}',
+                                                           title: "Possible missing zap paths")
+            append_step_summary <<~MARKDOWN
+              ## Possible missing zap paths
+
+              `brew generate-zap #{cask.full_name}` found paths not covered by the current zap stanza:
+
+              ```text
+              #{missing_paths.join("\n")}
+              ```
+            MARKDOWN
+          EOF
+        if: >
+          always() &&
+          steps.install.outcome == 'success' &&
+          runner.os == 'macOS' &&
+          (
+            contains(matrix.audit_args, '--new') ||
+            (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'check zap'))
+          )
+        timeout-minutes: 5
+
       - name: Run brew uninstall --cask ${{ matrix.cask.token }}
         run: brew uninstall --cask '${{ matrix.cask.path }}'
         if: always() && steps.install.outcome == 'success' && !fromJSON(steps.info.outputs.manual_installer)
