@@ -16,6 +16,7 @@ cask "whatsapp" do
   conflicts_with cask: "whatsapp@beta"
   depends_on macos: :monterey
 
+  # test
   app "WhatsApp.app"
 
   uninstall quit: "net.whatsapp.WhatsApp"
